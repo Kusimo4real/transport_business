@@ -8,6 +8,8 @@ Built for Martin U. - Tijuana Transportation Project
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from twilio.twiml.messaging_response import MessagingResponse
+from fastapi import Request, Response
 import sqlite3
 import os
 from typing import List, Dict, Any, Optional
@@ -210,6 +212,90 @@ async def search_routes(request: RouteSearchRequest):
     except Exception as e:
         logger.error(f"Search error: {e}")
         raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
+
+
+@app.post("/whatsapp")
+async def whatsapp_webhook(request: Request):
+    """
+    Handle incoming WhatsApp messages from Twilio
+    """
+    form_data = await request.form()
+    incoming_msg = form_data.get('Body', '').strip()
+    
+    # Initialize Twilio response
+    twilio_response = MessagingResponse()
+    
+    try:
+        # Parse the message - expect format: "Origin to Destination"
+        if ' to ' in incoming_msg.lower():
+            parts = incoming_msg.lower().split(' to ')
+        elif ' a ' in incoming_msg.lower():  # Spanish "a" = "to"
+            parts = incoming_msg.split(' a ')
+        else:
+            twilio_response.message(
+                "❌ Formato incorrecto.\n\n"
+                "Por favor usa:\n"
+                "*Origen* to *Destino*\n\n"
+                "Ejemplo: El Centro to El Refugio"
+            )
+            return Response(content=str(twilio_response), media_type="application/xml")
+        
+        if len(parts) != 2:
+            twilio_response.message(
+                "❌ No pude entender tu mensaje.\n\n"
+                "Usa el formato:\n"
+                "*Origen* to *Destino*"
+            )
+            return Response(content=str(twilio_response), media_type="application/xml")
+        
+        origen = parts[0].strip().title()
+        destino = parts[1].strip().title()
+        
+        # Search for routes using the same logic as /search endpoint
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        query = """
+            SELECT * FROM routes 
+            WHERE (ruta_ida LIKE ? OR ruta_vuelta LIKE ?) 
+            AND (ruta_ida LIKE ? OR ruta_vuelta LIKE ?)
+        """
+        
+        cursor.execute(query, 
+                       (f"%{origen}%", f"%{origen}%", 
+                        f"%{destino}%", f"%{destino}%"))
+        
+        routes = cursor.fetchall()
+        conn.close()
+        
+        # Format response for WhatsApp
+        if routes:
+            message = f"✅ Encontré {len(routes)} ruta(s):\n\n"
+            
+            for idx, route in enumerate(routes[:5], 1):
+                message += f"*{idx}. Ruta {route['id']}*\n"
+                message += f"📍 {route['ruta_ida']} ➡️ {route['ruta_vuelta']}\n"
+                message += f"🚌 Tipo: {route.get('tipo', 'N/A')}\n"
+                message += f"🎨 Color: {route.get('color', 'N/A')}\n\n"
+            
+            if len(routes) > 5:
+                message += f"... y {len(routes) - 5} rutas más."
+        else:
+            message = (
+                f"❌ No encontré rutas de *{origen}* a *{destino}*.\n\n"
+                "Verifica que los nombres estén correctos."
+            )
+        
+        twilio_response.message(message)
+        
+    except Exception as e:
+        twilio_response.message(
+            "⚠️ Error al procesar tu solicitud.\n"
+            "Por favor intenta de nuevo."
+        )
+        print(f"Error: {str(e)}")
+    
+    return Response(content=str(twilio_response), media_type="application/xml")
 
 if __name__ == "__main__":
     import uvicorn
