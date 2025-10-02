@@ -14,6 +14,7 @@ import sqlite3
 import os
 from typing import List, Dict, Any, Optional
 import logging
+import re
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -215,23 +216,56 @@ async def search_routes(request: RouteSearchRequest):
 
 
 @app.post("/whatsapp")
-
-async def search_routes(request: RouteSearchRequest):
+async def whatsapp_webhook(request: Request):
     """
-    Search for transportation routes based on origin and destination
-    Searches in both route names (Nombre1, Nombre2) and route stops (Paradas_ida, Paradas_vuelta)
-    As requested by Martin: find routes containing both origen and destino values
+    WhatsApp webhook endpoint to handle incoming messages from Twilio
+    Processes natural language route requests and returns formatted responses
     """
-    logger.info(f"Searching routes from '{request.origen}' to '{request.destino}'")
-    
     try:
+        # Get form data from Twilio webhook
+        form_data = await request.form()
+        incoming_msg = form_data.get("Body", "").strip()
+        from_number = form_data.get("From", "")
+        
+        logger.info(f"WhatsApp message from {from_number}: {incoming_msg}")
+        
+        # Create TwiML response
+        resp = MessagingResponse()
+        
+        if not incoming_msg:
+            resp.message("¡Hola! Envía tu búsqueda de ruta como: 'de [origen] a [destino]'\nEjemplo: 'de centro a aeropuerto'")
+            return Response(content=str(resp), media_type="application/xml")
+        
+        # Parse natural language input
+        # Look for patterns like "de X a Y" or "from X to Y"
+        
+        # Spanish patterns
+        spanish_pattern = r'(?:de\s+)(.+?)(?:\s+a\s+)(.+)'
+        # English patterns  
+        english_pattern = r'(?:from\s+)(.+?)(?:\s+to\s+)(.+)'
+        
+        origen = None
+        destino = None
+        
+        # Try Spanish pattern first
+        match = re.search(spanish_pattern, incoming_msg.lower())
+        if match:
+            origen = match.group(1).strip()
+            destino = match.group(2).strip()
+        else:
+            # Try English pattern
+            match = re.search(english_pattern, incoming_msg.lower())
+            if match:
+                origen = match.group(1).strip()
+                destino = match.group(2).strip()
+        
+        if not origen or not destino:
+            resp.message("Por favor usa el formato: 'de [origen] a [destino]'\nEjemplo: 'de centro a aeropuerto'")
+            return Response(content=str(resp), media_type="application/xml")
+        
+        # Search for routes using existing logic
         conn = get_db_connection()
         cursor = conn.cursor()
-        
-        # Search strategy based on Martin's requirements:
-        # 1. Look for routes where origen matches Nombre1 and destino matches Nombre2
-        # 2. Look for routes where origen matches Nombre2 and destino matches Nombre1 (reverse)
-        # 3. Look for routes where origen and destino appear in Paradas_ida or Paradas_vuelta
         
         query = """
         SELECT 
@@ -256,11 +290,12 @@ async def search_routes(request: RouteSearchRequest):
             (LOWER(Nombre1) LIKE LOWER(?) AND LOWER(Paradas_vuelta) LIKE LOWER(?)) OR
             (LOWER(Nombre2) LIKE LOWER(?) AND LOWER(Paradas_ida) LIKE LOWER(?))
         ORDER BY Ruta_ID
+        LIMIT 5
         """
         
-        # Prepare search parameters with wildcards for flexible matching
-        origen_param = f"%{request.origen}%"
-        destino_param = f"%{request.destino}%"
+        # Prepare search parameters
+        origen_param = f"%{origen}%"
+        destino_param = f"%{destino}%"
         
         cursor.execute(query, (
             origen_param, destino_param,    # Nombre1 -> Nombre2
@@ -274,35 +309,36 @@ async def search_routes(request: RouteSearchRequest):
         rows = cursor.fetchall()
         conn.close()
         
-        # Process results according to Martin's requirements
-        routes = []
-        for row in rows:
-            # Extract 3-5 main stops from Paradas_ida and Paradas_vuelta
-            main_stops = extract_main_stops_from_paradas(
-                row["Paradas_ida"] or "", 
-                row["Paradas_vuelta"] or ""
-            )
+        # Format response for WhatsApp
+        if not rows:
+            message = f"❌ No encontré rutas de '{origen}' a '{destino}'\n\nIntenta con nombres más específicos o diferentes variaciones."
+        else:
+            message = f"🚌 Rutas de *{origen}* a *{destino}*:\n\n"
             
-            route = RouteInfo(
-                route_id=row["Ruta_ID"] or "N/A",
-                origin=row["Nombre1"] or "Unknown",
-                destination=row["Nombre2"] or "Unknown", 
-                type=row["Tipo_Vehiculo"] or "Unknown",
-                color=row["Color_vehiculo"] or "Unknown",
-                main_stops=main_stops
-            )
-            routes.append(route)
+            for i, row in enumerate(rows[:3], 1):  # Limit to 3 routes for WhatsApp
+                main_stops = extract_main_stops_from_paradas(
+                    row["Paradas_ida"] or "", 
+                    row["Paradas_vuelta"] or ""
+                )
+                
+                stops_text = ", ".join(main_stops[:3]) if main_stops else "Sin paradas"
+                
+                message += f"*{i}. Ruta {row['Ruta_ID']}*\n"
+                message += f"📍 {row['Nombre1']} ↔ {row['Nombre2']}\n"
+                message += f"🚐 {row['Tipo_Vehiculo']} ({row['Color_vehiculo']})\n"
+                message += f"🛑 Paradas: {stops_text}\n\n"
+            
+            if len(rows) > 3:
+                message += f"... y {len(rows) - 3} rutas más disponibles"
         
-        logger.info(f"Found {len(routes)} routes for {request.origen} -> {request.destino}")
-        
-        return SearchResponse(
-            total_routes=len(routes),
-            routes=routes
-        )
+        resp.message(message)
+        return Response(content=str(resp), media_type="application/xml")
         
     except Exception as e:
-        logger.error(f"Search error: {e}")
-        raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
+        logger.error(f"WhatsApp webhook error: {e}")
+        resp = MessagingResponse()
+        resp.message("❌ Error procesando tu solicitud. Intenta de nuevo.")
+        return Response(content=str(resp), media_type="application/xml")
 
 if __name__ == "__main__":
     import uvicorn
