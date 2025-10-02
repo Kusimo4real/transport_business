@@ -215,87 +215,94 @@ async def search_routes(request: RouteSearchRequest):
 
 
 @app.post("/whatsapp")
-async def whatsapp_webhook(request: Request):
+
+async def search_routes(request: RouteSearchRequest):
     """
-    Handle incoming WhatsApp messages from Twilio
+    Search for transportation routes based on origin and destination
+    Searches in both route names (Nombre1, Nombre2) and route stops (Paradas_ida, Paradas_vuelta)
+    As requested by Martin: find routes containing both origen and destino values
     """
-    form_data = await request.form()
-    incoming_msg = form_data.get('Body', '').strip()
-    
-    # Initialize Twilio response
-    twilio_response = MessagingResponse()
+    logger.info(f"Searching routes from '{request.origen}' to '{request.destino}'")
     
     try:
-        # Parse the message - expect format: "Origin to Destination"
-        if ' to ' in incoming_msg.lower():
-            parts = incoming_msg.lower().split(' to ')
-        elif ' a ' in incoming_msg.lower():  # Spanish "a" = "to"
-            parts = incoming_msg.split(' a ')
-        else:
-            twilio_response.message(
-                "❌ Formato incorrecto.\n\n"
-                "Por favor usa:\n"
-                "*Origen* to *Destino*\n\n"
-                "Ejemplo: El Centro to El Refugio"
-            )
-            return Response(content=str(twilio_response), media_type="application/xml")
-        
-        if len(parts) != 2:
-            twilio_response.message(
-                "❌ No pude entender tu mensaje.\n\n"
-                "Usa el formato:\n"
-                "*Origen* to *Destino*"
-            )
-            return Response(content=str(twilio_response), media_type="application/xml")
-        
-        origen = parts[0].strip().title()
-        destino = parts[1].strip().title()
-        
-        # Search for routes using the same logic as /search endpoint
         conn = get_db_connection()
         cursor = conn.cursor()
         
+        # Search strategy based on Martin's requirements:
+        # 1. Look for routes where origen matches Nombre1 and destino matches Nombre2
+        # 2. Look for routes where origen matches Nombre2 and destino matches Nombre1 (reverse)
+        # 3. Look for routes where origen and destino appear in Paradas_ida or Paradas_vuelta
+        
         query = """
-            SELECT * FROM routes 
-            WHERE (ruta_ida LIKE ? OR ruta_vuelta LIKE ?) 
-            AND (ruta_ida LIKE ? OR ruta_vuelta LIKE ?)
+        SELECT 
+            Ruta_ID,
+            Nombre1,
+            Nombre2,
+            Tipo_Vehiculo,
+            Color_vehiculo,
+            Paradas_ida,
+            Paradas_vuelta
+        FROM rutas 
+        WHERE 
+            -- Direct route matching
+            (LOWER(Nombre1) LIKE LOWER(?) AND LOWER(Nombre2) LIKE LOWER(?)) OR
+            -- Reverse route matching  
+            (LOWER(Nombre2) LIKE LOWER(?) AND LOWER(Nombre1) LIKE LOWER(?)) OR
+            -- Search in route stops (ida direction)
+            (LOWER(Paradas_ida) LIKE LOWER(?) AND LOWER(Paradas_ida) LIKE LOWER(?)) OR
+            -- Search in route stops (vuelta direction)
+            (LOWER(Paradas_vuelta) LIKE LOWER(?) AND LOWER(Paradas_vuelta) LIKE LOWER(?)) OR
+            -- Mixed search: origin in name, destination in stops
+            (LOWER(Nombre1) LIKE LOWER(?) AND LOWER(Paradas_vuelta) LIKE LOWER(?)) OR
+            (LOWER(Nombre2) LIKE LOWER(?) AND LOWER(Paradas_ida) LIKE LOWER(?))
+        ORDER BY Ruta_ID
         """
         
-        cursor.execute(query, 
-                       (f"%{origen}%", f"%{origen}%", 
-                        f"%{destino}%", f"%{destino}%"))
+        # Prepare search parameters with wildcards for flexible matching
+        origen_param = f"%{request.origen}%"
+        destino_param = f"%{request.destino}%"
         
-        routes = cursor.fetchall()
+        cursor.execute(query, (
+            origen_param, destino_param,    # Nombre1 -> Nombre2
+            origen_param, destino_param,    # Nombre2 -> Nombre1 (reverse)
+            origen_param, destino_param,    # Both in Paradas_ida
+            origen_param, destino_param,    # Both in Paradas_vuelta
+            origen_param, destino_param,    # Nombre1 -> Paradas_vuelta
+            origen_param, destino_param     # Nombre2 -> Paradas_ida
+        ))
+        
+        rows = cursor.fetchall()
         conn.close()
         
-        # Format response for WhatsApp
-        if routes:
-            message = f"✅ Encontré {len(routes)} ruta(s):\n\n"
-            
-            for idx, route in enumerate(routes[:5], 1):
-                message += f"*{idx}. Ruta {route['id']}*\n"
-                message += f"📍 {route['ruta_ida']} ➡️ {route['ruta_vuelta']}\n"
-                message += f"🚌 Tipo: {route.get('tipo', 'N/A')}\n"
-                message += f"🎨 Color: {route.get('color', 'N/A')}\n\n"
-            
-            if len(routes) > 5:
-                message += f"... y {len(routes) - 5} rutas más."
-        else:
-            message = (
-                f"❌ No encontré rutas de *{origen}* a *{destino}*.\n\n"
-                "Verifica que los nombres estén correctos."
+        # Process results according to Martin's requirements
+        routes = []
+        for row in rows:
+            # Extract 3-5 main stops from Paradas_ida and Paradas_vuelta
+            main_stops = extract_main_stops_from_paradas(
+                row["Paradas_ida"] or "", 
+                row["Paradas_vuelta"] or ""
             )
+            
+            route = RouteInfo(
+                route_id=row["Ruta_ID"] or "N/A",
+                origin=row["Nombre1"] or "Unknown",
+                destination=row["Nombre2"] or "Unknown", 
+                type=row["Tipo_Vehiculo"] or "Unknown",
+                color=row["Color_vehiculo"] or "Unknown",
+                main_stops=main_stops
+            )
+            routes.append(route)
         
-        twilio_response.message(message)
+        logger.info(f"Found {len(routes)} routes for {request.origen} -> {request.destino}")
+        
+        return SearchResponse(
+            total_routes=len(routes),
+            routes=routes
+        )
         
     except Exception as e:
-        twilio_response.message(
-            "⚠️ Error al procesar tu solicitud.\n"
-            "Por favor intenta de nuevo."
-        )
-        print(f"Error: {str(e)}")
-    
-    return Response(content=str(twilio_response), media_type="application/xml")
+        logger.error(f"Search error: {e}")
+        raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
